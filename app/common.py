@@ -59,3 +59,22 @@ def is_covered(lease_prefix_text, new_pool_network):
     """True when the delegated lease prefix is fully inside the new pool."""
     pfx = ipaddress.IPv6Network(lease_prefix_text, strict=False)
     return pfx.subnet_of(new_pool_network)
+
+
+def overlapping_slots(new_network, deleg_len, prefix_text, slot_count):
+    """Slots of `new_network` whose delegated prefix intersects `prefix_text`.
+
+    Computed with integer address arithmetic: no candidate prefix list is
+    ever expanded. Returns an empty range when the prefixes are disjoint.
+    """
+    lease = ipaddress.IPv6Network(prefix_text, strict=False)
+    if not lease.overlaps(new_network):
+        return range(0)
+    size = 1 << (new_network.max_prefixlen - deleg_len)
+    base = int(new_network.network_address)
+    low = max(int(lease.network_address), base)
+    high = min(int(lease.broadcast_address),
+               int(new_network.broadcast_address))
+    first = (low - base) // size
+    last = (high - base) // size
+    return range(max(0, first), min(slot_count - 1, last) + 1)

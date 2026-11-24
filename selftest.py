@@ -134,6 +134,150 @@ def test_swap_and_overlap():
     check("单次演练禁止二次换池", code == 400)
 
 
+def test_overlap_capacity_and_release():
+    print("[3c] 余量与领址排除未到期租约，分批到期后解挡")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    # /55 pool with /60 delegation = 32 slots. Old slots 0,1,2,5,6 are active;
+    # each maps to one new slot. Remaining capacity must be 27, and the
+    # blocked slots must not be handed out.
+    code, body = jpost(client, "/api/pool",
+                       {"cidr": "2001:db8:aaaa::/55", "deleg_len": 60})
+    check("换池响应余量=32-5 且排除数=5", code == 200
+          and body["slots"] == 32 and body["blocked"] == 5
+          and body["free"] == 27)
+    conn = connect(path)
+    fr = [tuple(r) for r in conn.execute(
+        "SELECT start_slot,end_slot FROM free_intervals"
+        " WHERE pool_id = 2 ORDER BY start_slot")]
+    check("新池空闲区间已扣掉被未到期旧租约占用的槽位",
+          fr == [(3, 5), (7, 32)])
+    check("阻挡槽位与旧租约一一对应",
+          [(r["slot"], r["lease_id"]) for r in conn.execute(
+              "SELECT slot, lease_id FROM pool_blocked_slots"
+              " WHERE pool_id = 2 ORDER BY slot")]
+          == [(0, 1), (1, 2), (2, 3), (5, 5), (6, 6)])
+    conn.close()
+
+    # Dashboard remaining capacity must equal the free-range total.
+    html = client.get("/").get_data(as_text=True)
+    check("页面余量显示 27 且列出阻挡 5", ">27<" in html and ">5<" in html)
+
+    # 3600 batch: old leases 1(slot0) and 2(slot1) expire -> new slots 0,1
+    # become free; leases on new slots 2/5/6 keep blocking.
+    jpost(client, "/api/advance", {"target_seconds": 3600})
+    code, body = jpost(client, "/api/advance/commit", {})
+    check("第一批按名单提交", code == 200 and sorted(body["settled"]) == [1, 2])
+    conn = connect(path)
+    fr = [tuple(r) for r in conn.execute(
+        "SELECT start_slot,end_slot FROM free_intervals"
+        " WHERE pool_id = 2 ORDER BY start_slot")]
+    blocked = [r["slot"] for r in conn.execute(
+        "SELECT slot FROM pool_blocked_slots WHERE pool_id = 2 ORDER BY slot")]
+    check("到期旧租约对应槽位解挡并入空闲区间", fr == [(0, 2), (3, 5), (7, 32)])
+    check("未到期的阻挡租约仍保留", blocked == [2, 5, 6])
+    conn.close()
+    code, body = jpost(client, "/api/lease", {"count": 1})
+    check("解挡后的首槽可领且不与在租旧前缀相交",
+          code == 200 and body["issued"][0]["slot"] == 0)
+
+    # 7200 batch: old slot2 and slot5 and the new lease on slot0 expire.
+    jpost(client, "/api/advance", {"target_seconds": 7200})
+    jpost(client, "/api/advance/commit", {})
+    conn = connect(path)
+    check("第二批后仅 slot6 仍阻挡", [r["slot"] for r in conn.execute(
+        "SELECT slot FROM pool_blocked_slots WHERE pool_id = 2")] == [6])
+    conn.close()
+
+    # Last blocker (old slot6, expiry 10800) must not be offered before it
+    # expires; once the advance commits, its slot becomes available.
+    jpost(client, "/api/advance", {"target_seconds": 10800})
+    jpost(client, "/api/advance/commit", {})
+    conn = connect(path)
+    check("最后一笔阻挡租约到期提交后全部槽位可领", conn.execute(
+        "SELECT COUNT(*) c FROM pool_blocked_slots WHERE pool_id = 2"
+    ).fetchone()["c"] == 0 and conn.execute(
+        "SELECT SUM(end_slot-start_slot) s FROM free_intervals WHERE pool_id=2"
+    ).fetchone()["s"] == 32)
+    conn.close()
+
+
+def test_batch_unblocks_only_due_leases():
+    print("[3d] 推进只处理本次到期租约及其挡住的新池前缀")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    # /52 pool: 256 new slots; each old /60 lease maps to exactly one slot.
+    jpost(client, "/api/pool", {"cidr": "2001:db8:aaaa::/52", "deleg_len": 60})
+    touched = []
+    import app.logic as logic
+    original = logic._reconcile_blocked
+
+    def spy(conn, new_pool, lease_id):
+        touched.append(lease_id)
+        return original(conn, new_pool, lease_id)
+
+    logic._reconcile_blocked = spy
+    try:
+        jpost(client, "/api/advance", {"target_seconds": 3600})
+        code, body = jpost(client, "/api/advance/commit", {})
+    finally:
+        logic._reconcile_blocked = original
+    check("本批只触碰到期租约 1/2，未扫其它在租明细",
+          code == 200 and sorted(touched) == [1, 2])
+
+    conn = connect(path)
+    check("不在本批的阻挡租约 3/5/6 原样保留",
+          [r["slot"] for r in conn.execute(
+              "SELECT slot FROM pool_blocked_slots WHERE pool_id = 2"
+              " ORDER BY slot")] == [2, 5, 6])
+    conn.close()
+
+
+def test_multi_slot_overlap_and_partial_unblock():
+    print("[3e] 一个前缀横跨多个新池槽位：部分解挡与余量")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    # /58 pool with /60 delegation = 4 slots covering old slots 0..3.
+    # Old slots 0,1 (exp 3600) and 2 (exp 7200) are active; slot 3 is free.
+    code, body = jpost(client, "/api/pool",
+                       {"cidr": "2001:db8:aaaa::/58", "deleg_len": 60})
+    check("换池只排除相交槽位，余量=1", code == 200
+          and body["blocked"] == 3 and body["free"] == 1)
+    conn = connect(path)
+    check("阻挡槽位 0/1/2 与空闲 [3,4)", [
+        (r["slot"], r["lease_id"]) for r in conn.execute(
+            "SELECT slot, lease_id FROM pool_blocked_slots ORDER BY slot")
+    ] == [(0, 1), (1, 2), (2, 3)] and [
+        tuple(r) for r in conn.execute(
+            "SELECT start_slot, end_slot FROM free_intervals"
+            " WHERE pool_id = 2")] == [(3, 4)])
+    conn.close()
+    # 3600: old slots 0,1 expire -> new slots 0,1 free, slot2 still blocked.
+    jpost(client, "/api/advance", {"target_seconds": 3600})
+    jpost(client, "/api/advance/commit", {})
+    conn = connect(path)
+    check("本次到期只解挡 slot0/1，slot2 仍挡", [
+        tuple(r) for r in conn.execute(
+            "SELECT start_slot, end_slot FROM free_intervals"
+            " WHERE pool_id = 2 ORDER BY start_slot")] == [(0, 2), (3, 4)]
+        and [r["slot"] for r in conn.execute(
+            "SELECT slot FROM pool_blocked_slots WHERE pool_id = 2")] == [2])
+    conn.close()
+    code, body = jpost(client, "/api/lease", {"count": 2})
+    check("解挡的两个槽位按 first-fit 发放", code == 200
+          and [x["slot"] for x in body["issued"]] == [0, 1])
+    # 7200: old slot2 and the two new leases expire; slot2 becomes free and
+    # the whole range coalesces.
+    jpost(client, "/api/advance", {"target_seconds": 7200})
+    jpost(client, "/api/advance/commit", {})
+    conn = connect(path)
+    check("最后一笔阻挡到期提交后全部 4 槽可领", [
+        tuple(r) for r in conn.execute(
+            "SELECT start_slot, end_slot FROM free_intervals"
+            " WHERE pool_id = 2")] == [(0, 4)])
+    conn.close()
+
+
 def test_slash56_boundary():
     print("[3b] /56 委派长度与严格边界")
     path = fresh_db()
@@ -348,6 +492,114 @@ def test_restart_and_no_scan():
         proc.wait()
 
 
+def test_legacy_volume_migration():
+    print("[8b] 旧卷校正：暂停领址、重启可重试、保留已发租约")
+    path = fresh_db()
+    # Emulate a volume written by an older build: the swap is committed with
+    # one whole-pool free range, a new-pool lease was already issued on an
+    # overlapping slot, and there is no calibration/blocked-slot data.
+    conn = connect(path)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO pools(cidr, prefix_len, deleg_len, slot_count, is_new)"
+        " VALUES ('2001:db8:aaaa::/55', 55, 60, 32, 1)")
+    conn.execute(
+        "INSERT INTO free_intervals(pool_id, start_slot, end_slot)"
+        " VALUES (2, 1, 32)")
+    conn.execute("UPDATE meta SET new_pool_id = 2")
+    conn.execute(
+        "INSERT INTO leases(pool_id, slot, prefix, starts_at, expires_at, status)"
+        " VALUES (2, 0, '2001:db8:aaaa::/60', 0, 7200, 'active')")
+    conn.execute("COMMIT")
+    conn.close()
+    before = connect(path)
+    history = [tuple(r) for r in before.execute(
+        "SELECT id, slot, expires_at, status FROM leases ORDER BY id")]
+    now_before = before.execute("SELECT now_seconds FROM meta").fetchone()[0]
+    before.close()
+
+    # Before any correction: leasing is paused (only a restart calibrates).
+    from app.logic import DrillError, allocate
+    conn = connect(path)
+    try:
+        allocate(conn, 1)
+        paused = False
+    except DrillError as exc:
+        paused = "校正" in str(exc)
+    conn.close()
+    check("旧卷校正完成前暂停领址", paused)
+
+    # Interrupted correction: pending marker committed, data not updated.
+    conn = connect(path)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO pool_calibration(pool_id, state, detail, updated_at)"
+        " VALUES (2, 'pending', 'interrupted', 0)")
+    conn.execute("COMMIT")
+    conn.close()
+    conn = connect(path)
+    check("校正中断后仍是 pending 且不可领址", conn.execute(
+        "SELECT state FROM pool_calibration WHERE pool_id=2").fetchone()[0]
+        == "pending")
+    conn.close()
+
+    # Restart retries and commits the correction in one transaction.
+    web = web_app(path).test_client()
+    conn = connect(path)
+    check("重启重试后校正完成", conn.execute(
+        "SELECT state FROM pool_calibration WHERE pool_id=2").fetchone()[0]
+        == "done")
+    check("校正后新池余量排除 5 个旧租约前缀", conn.execute(
+        "SELECT SUM(end_slot-start_slot) s FROM free_intervals"
+        " WHERE pool_id=2").fetchone()["s"] == 27)
+    check("已发租约与到期时间原样保留",
+          [tuple(r) for r in conn.execute(
+              "SELECT id, slot, expires_at, status FROM leases ORDER BY id")]
+          == history)
+    check("校正不推进模拟时钟",
+          conn.execute("SELECT now_seconds FROM meta").fetchone()[0]
+          == now_before)
+    conn.close()
+
+    code, body = jpost(web, "/api/lease", {"count": 1})
+    check("校正后首笔领址落在未被占用的槽位", code == 200
+          and body["issued"][0]["slot"] == 3)
+    # The legacy new-pool lease on slot 0 must stay unavailable even though it
+    # predates the block rows.
+    conn = connect(path)
+    check("旧卷遗留的新池在租槽位未被重复发放", conn.execute(
+        "SELECT COUNT(*) c FROM leases WHERE pool_id=2 AND slot=0"
+    ).fetchone()["c"] == 1)
+    conn.close()
+
+    # The same old lease keeps blocking until the real expiry: at 3600 only
+    # old slot0's own lease expires; but the legacy new lease (slot 0, 7200)
+    # still holds it, so the slot must remain unavailable.
+    jpost(web, "/api/advance", {"target_seconds": 3600})
+    jpost(web, "/api/advance/commit", {})
+    conn = connect(path)
+    check("旧租约到期后仍被在租新租约占用的槽位不释放", conn.execute(
+        "SELECT start_slot FROM free_intervals WHERE pool_id=2"
+        " AND start_slot <= 0 AND end_slot > 0").fetchone() is None)
+    conn.close()
+    jpost(web, "/api/advance", {"target_seconds": 7200})
+    jpost(web, "/api/advance/commit", {})
+    conn = connect(path)
+    check("该新租约自身到期提交后槽位释放", conn.execute(
+        "SELECT 1 FROM free_intervals WHERE pool_id=2"
+        " AND start_slot <= 0 AND end_slot > 0").fetchone() is not None)
+    conn.close()
+
+    # A second restart must not redo anything or rewrite the ranges.
+    web2 = web_app(path).test_client()
+    conn = connect(path)
+    check("再次重启不重复校正", [tuple(r) for r in conn.execute(
+        "SELECT pool_id, state FROM pool_calibration")] == [(2, "done")])
+    conn.close()
+    check("再次重启后仍可正常领址",
+          web2.post("/api/lease", json={"count": 1}).status_code == 200)
+
+
 def _wait_port(port, timeout=10):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -380,9 +632,13 @@ def test_abort_and_non_advance():
 if __name__ == "__main__":
     tests = [test_seed_and_gateway, test_invalid_config_keeps_state,
              test_swap_and_overlap, test_slash56_boundary,
+             test_overlap_capacity_and_release,
+             test_batch_unblocks_only_due_leases,
+             test_multi_slot_overlap_and_partial_unblock,
              test_lease_and_pool_full,
              test_expiry_with_pause_leases, test_list_changed_redo,
              test_commit_interruption, test_restart_and_no_scan,
+             test_legacy_volume_migration,
              test_abort_and_non_advance]
     for t in tests:
         t()

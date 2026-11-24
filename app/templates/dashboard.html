@@ -76,8 +76,16 @@
 </div>
 
 <h2>地址池与可领范围（持久化空闲区间，重启不回扫租约）</h2>
+{% for v in pools %}
+  {% if v.calibration == 'pending' %}
+  <p class="pending" style="padding:8px 10px;border-radius:6px">
+    ⚠ 新池 #{{ v.pool.id }} 旧卷校正未完成：领址已暂停。重启服务会重试校正，
+    校正在同一事务内提交后才恢复领址；已在线网关的查撤路不受影响。
+  </p>
+  {% endif %}
+{% endfor %}
 <table>
-<tr><th>池</th><th>角色</th><th>CIDR</th><th>委派</th><th>容量</th><th>剩余</th><th>空闲区间数</th><th>在租</th></tr>
+<tr><th>池</th><th>角色</th><th>CIDR</th><th>委派</th><th>容量</th><th>剩余</th><th>被旧租约阻挡</th><th>空闲区间数</th><th>在租</th></tr>
 {% for v in pools %}
 <tr>
   <td>#{{ v.pool.id }}</td>
@@ -88,11 +96,14 @@
   <td>/{{ v.pool.deleg_len }}</td>
   <td>{{ v.pool.slot_count }}</td>
   <td>{{ v.summary.free }}</td>
+  <td>{% if v.pool.is_new %}{{ v.summary.blocked }}{% else %}—{% endif %}</td>
   <td>{{ v.summary.fragments }}</td>
   <td>{{ v.active_count }}</td>
 </tr>
 {% endfor %}
 </table>
+<p class="muted">余量只统计持久化空闲区间；与任一有效租约相交的新池前缀已从空闲区间排除，
+不计入余量也不会被发放。最后一笔挡住它的租约到期并经时钟推进提交后，该前缀才重新可领。</p>
 
 <h2>最近租约（最新 30 条）</h2>
 <table>

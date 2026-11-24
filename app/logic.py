@@ -9,8 +9,10 @@ Concurrency model (SQLite WAL, single writer):
     consistent committed state.
 """
 import ipaddress
+import sqlite3
 
-from .common import (LEASE_SECONDS, slot_prefix, validate_pool)
+from .common import (LEASE_SECONDS, overlapping_slots, slot_prefix,
+                     validate_pool)
 from .db import connect
 
 
@@ -50,7 +52,96 @@ def free_summary(conn, pool_id):
     free = sum(r["end_slot"] - r["start_slot"] for r in rows)
     total = conn.execute(
         "SELECT slot_count FROM pools WHERE id = ?", (pool_id,)).fetchone()["slot_count"]
-    return {"total": total, "free": free, "fragments": len(rows)}
+    blocked = conn.execute(
+        "SELECT COUNT(DISTINCT slot) AS c FROM pool_blocked_slots"
+        " WHERE pool_id = ?", (pool_id,)).fetchone()["c"]
+    return {"total": total, "free": free, "fragments": len(rows),
+            "blocked": blocked}
+
+
+def _block_new_pool(conn, pool_id, network, deleg_len, slot_count):
+    """Exclude every new-pool slot intersecting a valid old-pool lease.
+
+    Rows are written to `pool_blocked_slots` and carved out of
+    `free_intervals` (never by enumerating candidate prefixes: only the
+    lease rows that really intersect contribute). Returns the number of
+    slots carved out by this call.
+    """
+    old = conn.execute("SELECT id FROM pools WHERE is_new = 0").fetchone()
+    rows = conn.execute(
+        "SELECT id, prefix FROM leases WHERE pool_id = ? AND status = 'active'"
+        " ORDER BY id", (old["id"],)).fetchall()
+    blocked = 0
+    for lease in rows:
+        for slot in overlapping_slots(network, deleg_len, lease["prefix"],
+                                      slot_count):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO pool_blocked_slots(pool_id, slot, lease_id)"
+                " VALUES (?, ?, ?)", (pool_id, slot, lease["id"]))
+            if cur.rowcount and _remove_slot(conn, pool_id, slot):
+                blocked += 1
+    return blocked
+
+
+def calibrate_pool(conn, now=None):
+    """Bring a pool's overlap accounting up to date (old-volume migration).
+
+    Runs in one transaction. If the stored free ranges still cover the whole
+    pool the blocked slots are carved out from the persisted ranges; if the
+    volume is already partially migrated the blocked rows are reconciled
+    against the current free ranges. Idempotent, so an interrupted correction
+    is simply retried on the next start. Never expands candidate prefixes.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+        now = meta["now_seconds"] if now is None else now
+        pool_id = meta["new_pool_id"]
+        if pool_id is None:
+            conn.execute("COMMIT")
+            return None
+        row = conn.execute(
+            "SELECT * FROM pools WHERE id = ?", (pool_id,)).fetchone()
+        network = ipaddress.IPv6Network(row["cidr"])
+        _block_new_pool(conn, pool_id, network, row["deleg_len"],
+                        row["slot_count"])
+        # A volume written by an older build may also carry active new-pool
+        # leases whose slots are still listed as free; never offer those.
+        for lease in conn.execute(
+                "SELECT slot FROM leases WHERE pool_id = ? AND status = 'active'",
+                (pool_id,)).fetchall():
+            _remove_slot(conn, pool_id, lease["slot"])
+        _defragment(conn, pool_id)
+        # Report every blocked slot, including ones recorded by an earlier
+        # interrupted attempt (a retried correction must still say so).
+        blocked = conn.execute(
+            "SELECT COUNT(DISTINCT slot) AS c FROM pool_blocked_slots"
+            " WHERE pool_id = ?", (pool_id,)).fetchone()["c"]
+        conn.execute(
+            "INSERT INTO pool_calibration(pool_id, state, detail, updated_at)"
+            " VALUES (?, 'done', ?, ?)"
+            " ON CONFLICT(pool_id) DO UPDATE SET state = 'done',"
+            " detail = excluded.detail, updated_at = excluded.updated_at",
+            (pool_id, "校正完成：%d 个新池前缀被未到期旧租约占用，已从余量排除"
+             % blocked, now))
+        conn.execute(
+            "INSERT INTO clock_log(advance_id, event, from_seconds, to_seconds,"
+            " detail, at_seconds) VALUES (NULL, 'calibrate', ?, ?, ?, ?)",
+            (now, now, "新池 %s 校正完成，阻挡槽位 %d 个" % (row["cidr"], blocked),
+             now))
+        conn.execute("COMMIT")
+        return blocked
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def calibration_state(conn, pool_id):
+    """'done', 'pending' or None (old volume not migrated yet)."""
+    row = conn.execute(
+        "SELECT state FROM pool_calibration WHERE pool_id = ?",
+        (pool_id,)).fetchone()
+    return row["state"] if row else None
 
 
 # --------------------------------------------------------------------------
@@ -76,38 +167,62 @@ def _take_first_slot(conn, pool_id):
     return slot
 
 
-def _release_slot(conn, pool_id, slot):
-    """Return a slot and coalesce every adjacent free range.
+def _remove_slot(conn, pool_id, slot):
+    """Carve one slot out of the persisted free ranges (used when a new-pool
+    slot is blocked by an unexpired old lease). Cost is one indexed lookup
+    plus at most one range split; leases are never scanned."""
+    row = conn.execute(
+        "SELECT rowid, start_slot, end_slot FROM free_intervals"
+        " WHERE pool_id = ? AND start_slot <= ? AND end_slot > ?",
+        (pool_id, slot, slot)).fetchone()
+    if row is None:
+        return False
+    start, end = row["start_slot"], row["end_slot"]
+    if end - start == 1:
+        conn.execute(
+            "DELETE FROM free_intervals WHERE rowid = ?", (row["rowid"],))
+    elif start == slot:
+        conn.execute(
+            "UPDATE free_intervals SET start_slot = ? WHERE rowid = ?",
+            (slot + 1, row["rowid"]))
+    elif end == slot + 1:
+        conn.execute(
+            "UPDATE free_intervals SET end_slot = ? WHERE rowid = ?",
+            (slot, row["rowid"]))
+    else:
+        conn.execute(
+            "UPDATE free_intervals SET end_slot = ? WHERE rowid = ?",
+            (slot, row["rowid"]))
+        conn.execute(
+            "INSERT INTO free_intervals(pool_id, start_slot, end_slot)"
+            " VALUES (?, ?, ?)", (pool_id, slot + 1, end))
+    return True
 
-    Cost is O(k) where k is the number of fragments absorbed, never the
-    number of leases in an occupied run. Within one clock-advance batch
-    slots may be released in any order (e.g. 0,1,3), so we first collect the
-    full connected component of ranges adjacent to [slot, slot+1), delete
-    it, then insert one maximal [start, end) range.
+
+def _release_slot(conn, pool_id, slot):
+    """Return a slot to the free ranges unless it is still unusable.
+
+    A slot is not released while an active lease of the same pool still holds
+    it (legacy overlap) or while a valid old-pool lease intersects it. Both
+    checks are indexed point lookups, never a scan of the lease table.
+    Coalescing happens once per batch in `_defragment`.
     """
-    start, end = slot, slot + 1
-    # Absorb stored ranges that touch or overlap the growing interval:
-    # range [a,b) joins exactly when a <= end AND b >= start. The SQL filter
-    # narrows the candidates; the Python guard rejects ranges that pass the
-    # loose bounds but are separated by a gap (e.g. [0,2) while start=3).
-    while True:
-        rows = conn.execute(
-            "SELECT rowid, start_slot, end_slot FROM free_intervals"
-            " WHERE pool_id = ? AND end_slot >= ? AND start_slot <= ?"
-            " ORDER BY start_slot",
-            (pool_id, start, end)).fetchall()
-        neighbor = next((r for r in rows
-                         if r["start_slot"] <= end and r["end_slot"] >= start),
-                        None)
-        if neighbor is None:
-            break
-        start = min(start, neighbor["start_slot"])
-        end = max(end, neighbor["end_slot"])
-        conn.execute("DELETE FROM free_intervals WHERE rowid = ?",
-                     (neighbor["rowid"],))
+    if conn.execute(
+            "SELECT 1 FROM pool_blocked_slots WHERE pool_id = ? AND slot = ?"
+            " LIMIT 1", (pool_id, slot)).fetchone():
+        return
+    if conn.execute(
+            "SELECT 1 FROM leases WHERE pool_id = ? AND slot = ?"
+            " AND status = 'active' LIMIT 1", (pool_id, slot)).fetchone():
+        return
+    if conn.execute(
+            "SELECT 1 FROM free_intervals WHERE pool_id = ?"
+            " AND start_slot <= ? AND end_slot > ? LIMIT 1",
+            (pool_id, slot, slot)).fetchone():
+        return
     conn.execute(
         "INSERT INTO free_intervals(pool_id, start_slot, end_slot)"
-        " VALUES (?, ?, ?)", (pool_id, start, end))
+        " VALUES (?, ?, ?)", (pool_id, slot, slot + 1))
 
 
 def _defragment(conn, pool_id):
@@ -144,6 +259,27 @@ def _defragment(conn, pool_id):
         conn.execute("DELETE FROM free_intervals WHERE rowid = ?", (rid,))
 
 
+def _reconcile_blocked(conn, new_pool, lease_id):
+    """Drop one settled lease's blocks and free only the slots nothing else
+    still holds. Touches just that lease's block rows (indexed), so the cost
+    is the number of slots that lease intersected, never the lease table."""
+    rows = conn.execute(
+        "SELECT slot FROM pool_blocked_slots WHERE lease_id = ?"
+        " AND pool_id = ?", (lease_id, new_pool["id"])).fetchall()
+    for row in rows:
+        slot = row["slot"]
+        conn.execute(
+            "DELETE FROM pool_blocked_slots"
+            " WHERE pool_id = ? AND lease_id = ? AND slot = ?",
+            (new_pool["id"], lease_id, slot))
+        still_blocked = conn.execute(
+            "SELECT 1 FROM pool_blocked_slots WHERE pool_id = ? AND slot = ?"
+            " LIMIT 1", (new_pool["id"], slot)).fetchone()
+        if still_blocked:
+            continue
+        _release_slot(conn, new_pool["id"], slot)
+
+
 # --------------------------------------------------------------------------
 # Pool swap
 # --------------------------------------------------------------------------
@@ -177,6 +313,12 @@ def change_pool(conn, cidr_text, deleg_len):
         conn.execute(
             "INSERT INTO free_intervals(pool_id, start_slot, end_slot)"
             " VALUES (?, 0, ?)", (new_id, slot_count))
+        # Mark calibration pending first: if anything fails below, the whole
+        # transaction rolls back and no new pool is visible at all.
+        conn.execute(
+            "INSERT INTO pool_calibration(pool_id, state, detail, updated_at)"
+            " VALUES (?, 'pending', ?, ?)",
+            (new_id, "换池后校正未完成，暂停领址", now))
         conn.execute(
             "UPDATE meta SET new_pool_id = ? WHERE id = 1", (new_id,))
         conn.execute(
@@ -184,12 +326,74 @@ def change_pool(conn, cidr_text, deleg_len):
             " detail, at_seconds) VALUES (NULL, 'pool-swap', ?, ?, ?, ?)",
             (now, now, "新池 %s 上线，委派 /%d，共 %d 个前缀；旧租约按原期限到期"
              % (cidr, deleg_len, slot_count), now))
+        # Same transaction: exclude every slot that an active old lease still
+        # occupies, so neither the remaining capacity nor allocation can
+        # offer a prefix that overlaps a valid lease.
+        _block_new_pool(conn, new_id, network, deleg_len, slot_count)
+        _defragment(conn, new_id)
+        blocked = conn.execute(
+            "SELECT COUNT(DISTINCT slot) AS c FROM pool_blocked_slots"
+            " WHERE pool_id = ?", (new_id,)).fetchone()["c"]
+        conn.execute(
+            "UPDATE pool_calibration SET state = 'done', detail = ?,"
+            " updated_at = ? WHERE pool_id = ?",
+            (blocked, now, new_id))
         _republish_withdrawal(conn)
         conn.execute("COMMIT")
-        return new_id, cidr, deleg_len, slot_count
+        return new_id, cidr, deleg_len, slot_count, blocked
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def startup_calibrate(db_path=None, max_attempts=3):
+    """One-shot startup step for the writer process.
+
+    A committed new pool without a `done` calibration (i.e. a volume written
+    by an older build) is paused for leasing first, then corrected in one
+    transaction. Any interruption rolls the correction back while the
+    pending marker stays committed, so the next start simply retries. On an
+    already-calibrated volume this is two indexed lookups and never a lease
+    scan. Returns the correction result, or None when nothing was needed.
+    """
+    last = None
+    for _ in range(max_attempts):
+        conn = connect(db_path)
+        try:
+            meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+            pool_id = meta["new_pool_id"]
+            if pool_id is None or calibration_state(conn, pool_id) == "done":
+                return None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = conn.execute(
+                    "SELECT now_seconds FROM meta WHERE id = 1").fetchone()[
+                        "now_seconds"]
+                conn.execute(
+                    "INSERT INTO pool_calibration(pool_id, state, detail,"
+                    " updated_at) VALUES (?, 'pending', ?, ?)"
+                    " ON CONFLICT(pool_id) DO UPDATE SET state = 'pending',"
+                    " detail = excluded.detail, updated_at = excluded.updated_at",
+                    (pool_id, "旧卷校正未完成，暂停领址", now))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+        try:
+            cal = connect(db_path)
+            try:
+                return calibrate_pool(cal)
+            finally:
+                cal.close()
+        except sqlite3.OperationalError as exc:
+            # Concurrent writer holds the lock: pending stays, try again.
+            last = exc
+        except Exception as exc:  # leave pending; a restart retries
+            last = exc
+            break
+    return last
 
 
 # --------------------------------------------------------------------------
@@ -213,6 +417,15 @@ def allocate(conn, count=1):
         pool_id = active_pool_id(conn, meta)
         pool = conn.execute(
             "SELECT * FROM pools WHERE id = ?", (pool_id,)).fetchone()
+        # A volume from an older build may still hold a new pool whose
+        # overlap accounting has not been corrected. Never lease from it
+        # until the one-shot startup/retry calibration has committed.
+        if pool["is_new"] and meta["new_pool_id"] is not None:
+            cal = conn.execute(
+                "SELECT state FROM pool_calibration WHERE pool_id = ?",
+                (pool_id,)).fetchone()
+            if cal is None or cal["state"] != "done":
+                raise DrillError("旧卷校正未完成，已暂停领址；请重启服务完成校正后重试")
         network = ipaddress.IPv6Network(pool["cidr"])
         now = meta["now_seconds"]
         issued = []
@@ -329,16 +542,36 @@ def commit_advance(conn, fault_inject=False):
 
         settled = current  # contains any leases newly taken during the pause
         added = sorted(cur_set - snap_set)
+        old_pool = conn.execute(
+            "SELECT id FROM pools WHERE is_new = 0").fetchone()
+        new_pool = None
+        if meta["new_pool_id"] is not None:
+            new_pool = conn.execute(
+                "SELECT * FROM pools WHERE id = ?",
+                (meta["new_pool_id"],)).fetchone()
         touched_pools = set()
+        unblocked = 0
         for lease_id in settled:
             row = conn.execute(
-                "SELECT pool_id, slot FROM leases WHERE id = ?",
+                "SELECT pool_id, slot, prefix FROM leases WHERE id = ?",
                 (lease_id,)).fetchone()
             conn.execute(
                 "UPDATE leases SET status = 'expired' WHERE id = ?",
                 (lease_id,))
             _release_slot(conn, row["pool_id"], row["slot"])
             touched_pools.add(row["pool_id"])
+            # Only leases settled by *this* batch can lift a new-pool block,
+            # and only the slots they actually intersect are re-examined. No
+            # other lease is scanned and no candidate prefix is enumerated.
+            if new_pool is not None and row["pool_id"] == old_pool["id"]:
+                held = conn.execute(
+                    "SELECT 1 FROM pool_blocked_slots"
+                    " WHERE pool_id = ? AND lease_id = ? LIMIT 1",
+                    (new_pool["id"], lease_id)).fetchone()
+                if held:
+                    _reconcile_blocked(conn, new_pool, lease_id)
+                    unblocked += 1
+                    touched_pools.add(new_pool["id"])
         # Slots released in one batch may bridge ranges that were not yet
         # adjacent at each individual release; coalesce once at the end.
         for pool_id in touched_pools:
@@ -354,10 +587,12 @@ def commit_advance(conn, fault_inject=False):
             "INSERT INTO clock_log(advance_id, event, from_seconds, to_seconds,"
             " detail, at_seconds) VALUES (?, 'commit', ?, ?, ?, ?)",
             (adv["id"], meta["now_seconds"], target,
-             "本次到期 %d 条：%s%s"
+             "本次到期 %d 条：%s%s%s"
              % (len(settled), ",".join(map(str, settled)) or "无",
                 ("；其中暂停期间新领并计入：%s" % ",".join(map(str, added)))
-                if added else ""), target))
+                if added else "",
+                ("；解除新池阻挡租约 %d 条" % unblocked) if unblocked else ""),
+             target))
         _republish_withdrawal(conn)
         if fault_inject:
             # Simulate losing the process immediately before COMMIT. SQLite

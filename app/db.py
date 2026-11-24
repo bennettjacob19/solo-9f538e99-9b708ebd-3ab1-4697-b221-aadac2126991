@@ -5,6 +5,11 @@ ranges of delegation slots. Allocation only touches the first free range,
 so its cost depends on the number of *free fragments*, never on the number
 of leases inside a contiguous occupied run. The ranges are persisted, so
 restart never scans leases to rebuild them.
+
+A new pool may overlap prefixes that are still leased from the old pool.
+`pool_blocked_slots` records those intersections and `free_intervals`
+already excludes every blocked slot, so free-space accounting and
+allocation never have to consult active leases.
 """
 import os
 import sqlite3
@@ -33,6 +38,31 @@ CREATE TABLE IF NOT EXISTS free_intervals(
     start_slot INTEGER NOT NULL,
     end_slot INTEGER NOT NULL,
     PRIMARY KEY (pool_id, start_slot)
+);
+
+-- Slots of a new pool that intersect an active old-pool lease. These slots
+-- are excluded from free_intervals while the blocking lease is valid, so
+-- neither the free summary nor allocation ever needs to look at leases.
+CREATE TABLE IF NOT EXISTS pool_blocked_slots(
+    pool_id INTEGER NOT NULL REFERENCES pools(id),
+    slot INTEGER NOT NULL,
+    lease_id INTEGER NOT NULL REFERENCES leases(id),
+    PRIMARY KEY (pool_id, slot, lease_id)
+);
+CREATE INDEX IF NOT EXISTS ix_blocked_pool_slot
+    ON pool_blocked_slots(pool_id, slot);
+CREATE INDEX IF NOT EXISTS ix_blocked_lease
+    ON pool_blocked_slots(lease_id);
+
+-- One row per new pool that has been (or must be) calibrated against the
+-- active old leases. A volume written by an older build has a new pool but
+-- no row here: startup marks it pending, pauses leasing and retries the
+-- correction atomically until it commits.
+CREATE TABLE IF NOT EXISTS pool_calibration(
+    pool_id INTEGER PRIMARY KEY REFERENCES pools(id),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'done')),
+    detail TEXT,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS leases(

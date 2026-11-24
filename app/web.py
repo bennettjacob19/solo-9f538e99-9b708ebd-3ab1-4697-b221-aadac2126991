@@ -12,8 +12,9 @@ from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from .db import connect, init_db, recover_pending
 from .logic import (DrillError, ListChanged, abort_advance, allocate,
-                    change_pool, commit_advance, free_summary, get_state,
-                    prepare_advance, recent_logs)
+                    calibration_state, change_pool, commit_advance,
+                    free_summary, get_state, prepare_advance, recent_logs,
+                    startup_calibrate)
 
 
 def create_app(db_path=None):
@@ -40,6 +41,8 @@ def create_app(db_path=None):
                     (pool["id"],)).fetchone()["c"]
                 pool_views.append({
                     "pool": pool, "summary": summary, "active_count": active_count,
+                    "calibration": calibration_state(conn, pool["id"])
+                                   if pool["is_new"] else "done",
                     "is_active": pool["id"] == (meta["new_pool_id"]
                                                 or state["pools"][0]["id"])})
             leases = conn.execute(
@@ -65,10 +68,14 @@ def create_app(db_path=None):
         deleg = request.form.get("deleg_len") or (request.json or {}).get("deleg_len")
         conn = db()
         try:
-            new_id, cidr, deleg_len, slots = change_pool(conn, cidr, deleg)
+            new_id, cidr, deleg_len, slots, blocked = change_pool(
+                conn, cidr, deleg)
             payload = {"ok": True, "pool_id": new_id, "cidr": cidr,
-                       "deleg_len": deleg_len, "slots": slots}
-            return _respond(payload, "新池 %s 已上线" % cidr)
+                       "deleg_len": deleg_len, "slots": slots,
+                       "blocked": blocked, "free": slots - blocked}
+            return _respond(
+                payload, "新池 %s 已上线，余量 %d（排除与未到期旧租约相交的 %d 个前缀）"
+                % (cidr, slots - blocked, blocked))
         except DrillError as exc:
             return _respond({"ok": False, "error": str(exc)}, str(exc), ok=False)
         finally:
@@ -158,6 +165,10 @@ def create_app(db_path=None):
         # One-shot recovery for advances stranded by an interrupted process.
         recover_pending(conn)
         conn.close()
+        # Old-volume correction: pause leasing, then commit the free-range
+        # exclusion of new-pool slots intersecting valid old leases. Failure
+        # leaves the pending marker; the next start retries.
+        startup_calibrate(app.config.get("DB_PATH"))
     return app
 
 
