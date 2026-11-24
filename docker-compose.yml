@@ -1,0 +1,39 @@
+services:
+  web:
+    build: .
+    image: ipv6-pool-swap-drill
+    container_name: pool-drill-web
+    environment:
+      DRILL_DB: /data/pool_drill.db
+    volumes:
+      - drill-data:/data
+    ports:
+      - "8000:8000"
+    entrypoint: ["/usr/local/bin/entrypoint-web.sh"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+
+  gateway:
+    image: ipv6-pool-swap-drill
+    container_name: pool-drill-gateway
+    environment:
+      DRILL_DB: /data/pool_drill.db
+    volumes:
+      - drill-data:/data
+    ports:
+      - "8001:8001"
+    entrypoint: ["/usr/local/bin/entrypoint-gateway.sh"]
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+
+volumes:
+  drill-data:

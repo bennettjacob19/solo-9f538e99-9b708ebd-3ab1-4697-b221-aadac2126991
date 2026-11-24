@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>IPv6 换池演练 · 单网关值班台</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", sans-serif; margin: 24px; color: #1a2330; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-bottom: 8px; }
+  th, td { border: 1px solid #c9d2de; padding: 5px 8px; text-align: left; }
+  th { background: #eef2f7; }
+  .card { border: 1px solid #c9d2de; border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  input, select { padding: 6px 8px; font-size: 13px; }
+  button { padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .active { background: #d9f2e3; color: #0d6b35; }
+  .old { background: #fdecdc; color: #9a4a12; }
+  .pending { background: #fff3c4; color: #8a6d00; }
+  .expired { color: #8a94a3; text-decoration: line-through; }
+  .flash { background: #e7f0ff; border: 1px solid #9bb8f0; padding: 10px 12px; border-radius: 8px; }
+  code { background: #f2f4f7; padding: 1px 5px; border-radius: 4px; }
+  .muted { color: #66717f; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>单网关 IPv6 地址池换池演练（模拟时钟，单位：秒）</h1>
+{% if request.args.get('msg') %}
+  <p class="flash">{{ request.args.get('msg') }}</p>
+{% endif %}
+
+<div class="card">
+  <strong>当前模拟时钟 t = {{ meta.now_seconds }}s</strong>
+  （60 分钟 = 3600s）　·　新池状态：
+  {% if meta.new_pool_id %}<span class="tag active">已上线，仅从新池发放</span>
+  {% else %}<span class="tag old">未换池，仍使用内置旧池</span>{% endif %}
+  {% if pending %}
+    <p class="pending" style="padding:8px 10px;border-radius:6px;display:inline-block">
+      ⏸ 暂停待提交：推进 #{{ pending.id }} → t={{ pending.target_seconds }}s，
+      预计到期租约 [{{ pending.snapshot_ids }}]。期间可正常领址、网关可照常查撤路；
+      名单变化会退回并要求重做。
+      <form method="post" action="/api/advance/commit" style="display:inline">
+        <button type="submit">提交推进</button></form>
+      <form method="post" action="/api/advance/abort" style="display:inline">
+        <button type="submit">退回重做</button></form>
+    </p>
+  {% endif %}
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2 style="margin-top:0">① 录入已上线新池 CIDR 与委派长度</h2>
+    <form method="post" action="/api/pool">
+      <p><label>新池 CIDR：<input name="cidr" size="30" placeholder="2001:db8:bbbb::/56" required></label></p>
+      <p><label>委派长度：
+        <select name="deleg_len"><option value="56">/56</option><option value="60" selected>/60</option></select>
+      </label></p>
+      <button type="submit">换池（无效配置保留原状）</button>
+    </form>
+    <p class="muted">单次演练只允许换一次；换池不展开候选前缀，空闲空间以区间 [start,end) 持久化。</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">② 领址（60 分钟租约，避开未到期前缀）</h2>
+    <form method="post" action="/api/lease">
+      <p><label>数量：<input name="count" value="1" inputmode="numeric" size="6"></label>
+         <button type="submit">从当前活动池领取</button></p>
+    </form>
+    <h2 style="margin-top:12px">③ 推进模拟时钟（两阶段：先暂停核算，再提交）</h2>
+    <form method="post" action="/api/advance">
+      <p><label>目标时刻（秒）：<input name="target_seconds" inputmode="numeric"
+              value="{{ meta.now_seconds + 3600 }}" size="10" required></label>
+         <button type="submit">暂停并核算本次到期</button></p>
+    </form>
+  </div>
+</div>
+
+<h2>地址池与可领范围（持久化空闲区间，重启不回扫租约）</h2>
+<table>
+<tr><th>池</th><th>角色</th><th>CIDR</th><th>委派</th><th>容量</th><th>剩余</th><th>空闲区间数</th><th>在租</th></tr>
+{% for v in pools %}
+<tr>
+  <td>#{{ v.pool.id }}</td>
+  <td>{% if v.pool.is_new %}<span class="tag active">新池</span>
+      {% else %}<span class="tag old">内置旧池</span>{% endif %}
+      {% if v.is_active %} · 当前发放池{% endif %}</td>
+  <td><code>{{ v.pool.cidr }}</code></td>
+  <td>/{{ v.pool.deleg_len }}</td>
+  <td>{{ v.pool.slot_count }}</td>
+  <td>{{ v.summary.free }}</td>
+  <td>{{ v.summary.fragments }}</td>
+  <td>{{ v.active_count }}</td>
+</tr>
+{% endfor %}
+</table>
+
+<h2>最近租约（最新 30 条）</h2>
+<table>
+<tr><th>ID</th><th>池</th><th>槽位</th><th>委派前缀</th><th>起 t</th><th>到期 t</th><th>状态</th></tr>
+{% for l in leases %}
+<tr>
+  <td>{{ l.id }}</td><td>{{ l.pool_cidr }}</td><td>{{ l.slot }}</td>
+  <td><code>{{ l.prefix }}</code></td><td>{{ l.starts_at }}</td>
+  <td>{{ l.expires_at }}</td>
+  <td class="{{ l.status }}">{{ l.status }}</td>
+</tr>
+{% endfor %}
+</table>
+
+<h2>操作日志（时钟/池/撤路同事务生效）</h2>
+<table>
+<tr><th>#</th><th>事件</th><th>from→to</th><th>明细</th><th>记录时刻</th></tr>
+{% for g in logs %}
+<tr><td>{{ g.id }}</td><td>{{ g.event }}</td>
+<td>{{ g.from_seconds if g.from_seconds is not none else '—' }} →
+    {{ g.to_seconds if g.to_seconds is not none else '—' }}</td>
+<td>{{ g.detail }}</td><td>{{ g.at_seconds }}</td></tr>
+{% endfor %}
+</table>
+<p class="muted">独立网关进程（只读）：<code>GET /withdrawal</code> 返回已发布最早撤路时刻与未覆盖的有效旧租约。</p>
+</body>
+</html>
